@@ -18,12 +18,12 @@ func TestNewOvsdbDriver(t *testing.T) {
 
 func TestAddlPort(t *testing.T) {
 	d := initOvsdbDriver(t)
-	err := d.AddPort("", "port2", 10, 100, 1000)
+	err := d.AddPort("", "port1", 10, 100, 1000)
 	if err != nil {
 		t.Fatalf("AddPort failed. Error: %s", err)
 	}
 
-	err = d.DelPort("port2")
+	err = d.DelPort("port1")
 	if err != nil {
 		t.Fatalf("DelPort failed. Error: %s", err)
 	}
