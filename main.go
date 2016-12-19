@@ -1,16 +1,43 @@
 package main
 
 import (
-	"fmt"
+	"os"
 
 	"github.com/XiaoweiQian/ovs-driver/drivers"
+	pluginNet "github.com/docker/go-plugins-helpers/network"
+)
+
+const (
+	version = "0.1"
 )
 
 func main() {
 
-	d := drivers.Driver{}
-	fmt.Println(1122333)
-	fmt.Println(d)
-	//h := network.NewHandler(d)
-	//h.ServeUnix("root", "mydriver")
+	var flagDebug = cli.BoolFlag{
+		Name:  "debug, d",
+		Usage: "enable debugging",
+	}
+	app := cli.NewApp()
+	app.Name = "docker-ovs"
+	app.Usage = "Docker Open vSwitch Networking"
+	app.Version = version
+	app.Flags = []cli.Flag{
+		flagDebug,
+	}
+	app.Action = Run
+	app.Run(os.Args)
+}
+
+// Run initializes the driver
+func Run(ctx *cli.Context) {
+	if ctx.Bool("debug") {
+		log.SetLevel(log.DebugLevel)
+	}
+
+	d, err := drivers.NewDriver()
+	if err != nil {
+		panic(err)
+	}
+	h := pluginNet.NewHandler(d)
+	h.ServeUnix("root", "ovs")
 }

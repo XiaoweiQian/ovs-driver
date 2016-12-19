@@ -65,6 +65,18 @@
 			"Rev": "25888126ec4465200ff14c087b497ba64d761041"
 		},
 		{
+			"ImportPath": "github.com/vishvananda/netlink",
+			"Rev": "c750a61f1836d48aacb1c74deafb05cfb549eb92"
+		},
+		{
+			"ImportPath": "github.com/vishvananda/netlink/nl",
+			"Rev": "c750a61f1836d48aacb1c74deafb05cfb549eb92"
+		},
+		{
+			"ImportPath": "github.com/vishvananda/netns",
+			"Rev": "8ba1072b58e0c2a240eb5f6120165c7776c3e7b8"
+		},
+		{
 			"ImportPath": "golang.org/x/net/proxy",
 			"Rev": "45e771701b814666a7eb299e6c7a57d0b1799e91"
 		},

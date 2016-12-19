@@ -27,7 +27,7 @@ type OvsdbDriver struct {
 	bridgeName string
 	ovsClient  *libovsdb.OvsdbClient
 	cache      map[string]map[libovsdb.UUID]libovsdb.Row
-	cacheLock  sync.RWMutex
+	sync.RWMutex
 }
 
 // NewOvsdbDriver ...
@@ -55,14 +55,14 @@ func NewOvsdbDriver(bridgeName string) (*OvsdbDriver, error) {
 }
 
 // AddPort create a ovs internal port
-func (d *OvsdbDriver) AddPort(endpointID, portName string, tag, burst int, bandwidth int64) error {
+func (d *OvsdbDriver) AddPort(addr, mac, intfName string, tag int, burst, bandwidth int64) error {
 
 	intfUUID := "intf"
 	portUUID := "port"
 
 	// insert interface
 	intf := make(map[string]interface{})
-	intf["name"] = portName
+	intf["name"] = intfName
 	intf["type"] = internalPort
 	if bandwidth != 0 {
 		intf["ingress_policing_rate"] = bandwidth
@@ -80,7 +80,7 @@ func (d *OvsdbDriver) AddPort(endpointID, portName string, tag, burst int, bandw
 
 	// insert port
 	port := make(map[string]interface{})
-	port["name"] = portName
+	port["name"] = intfName
 	port["interfaces"] = libovsdb.UUID{GoUUID: intfUUID}
 	if tag != 0 {
 		port["vlan_mode"] = "access"
@@ -109,14 +109,28 @@ func (d *OvsdbDriver) AddPort(endpointID, portName string, tag, burst int, bandw
 	}
 
 	ops := []libovsdb.Operation{intfOp, portOp, mutateOp}
-	return d.doOperations(ops)
+	err := d.doOperations(ops)
+	if err != nil {
+		return err
+	}
+	// set ip
+	err = SetInterfaceIP(intfName, addr)
+	if err != nil {
+		return err
+	}
+	//set mac
+	err = SetInterfaceMac(intfName, mac)
+	if err != nil {
+		return err
+	}
+	return nil
 
 }
 
 // DelPort ...
-func (d *OvsdbDriver) DelPort(portName string) error {
-	portUUID := []libovsdb.UUID{{GoUUID: portName}}
-	condition := libovsdb.NewCondition("name", "==", portName)
+func (d *OvsdbDriver) DelPort(intfName string) error {
+	portUUID := []libovsdb.UUID{{GoUUID: intfName}}
+	condition := libovsdb.NewCondition("name", "==", intfName)
 
 	//delete interface
 	intfOp := libovsdb.Operation{
@@ -125,7 +139,7 @@ func (d *OvsdbDriver) DelPort(portName string) error {
 		Where: []interface{}{condition},
 	}
 	//delete port
-	condition = libovsdb.NewCondition("name", "==", portName)
+	condition = libovsdb.NewCondition("name", "==", intfName)
 	portOp := libovsdb.Operation{
 		Op:    deleteOp,
 		Table: portTable,
@@ -133,15 +147,15 @@ func (d *OvsdbDriver) DelPort(portName string) error {
 	}
 
 	// get from cache
-	d.cacheLock.RLock()
+	d.RLock()
 	for uuid, row := range d.cache["Port"] {
 		name := row.Fields["name"].(string)
-		if name == portName {
+		if name == intfName {
 			portUUID = []libovsdb.UUID{uuid}
 			break
 		}
 	}
-	d.cacheLock.RUnlock()
+	d.RUnlock()
 
 	// mutate the bridge
 	mutateSet, _ := libovsdb.NewOvsSet(portUUID)
@@ -156,13 +170,13 @@ func (d *OvsdbDriver) DelPort(portName string) error {
 
 	// do transaction
 	ops := []libovsdb.Operation{intfOp, portOp, mutateOp}
-	return d.doOperations(ops)
+	return d.doOperations(ops), nil
 
 }
 
 func (d *OvsdbDriver) populateCache(updates libovsdb.TableUpdates) {
-	d.cacheLock.Lock()
-	defer func() { d.cacheLock.Unlock() }()
+	d.Lock()
+	defer func() { d.Unlock() }()
 
 	for table, tableUpdate := range updates.Updates {
 		if _, ok := d.cache[table]; !ok {

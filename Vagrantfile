@@ -19,10 +19,10 @@ Vagrant.configure("2") do |config|
 
   # Every Vagrant development environment requires a box. You can search for
   # boxes at https://atlas.hashicorp.com/search.
-  config.vm.box = "centos/7"
+  config.vm.box = "XiaoweiQian/ovs-driver"
   config.ssh.username = 'root'
-  config.ssh.password = 'root'
-  config.ssh.insert_key = 'true'
+  #config.ssh.password = 'root'
+  config.ssh.insert_key = 'false'
   config.vm.synced_folder ".", "/opt/gocode/src/github.com/XiaoweiQian/ovs-driver"
   config.vm.provision :shell, inline: $script
   #config.vm.box_url = "file:///Users/xiaowei/VirtualBox%20VMs/ovs-driver.box"

@@ -18,7 +18,7 @@ func TestNewOvsdbDriver(t *testing.T) {
 
 func TestAddlPort(t *testing.T) {
 	d := initOvsdbDriver(t)
-	err := d.AddPort("", "port1", 10, 100, 1000)
+	err := d.AddPort("192.168.1.1", "11:11:11:11:11:11", "port1", 10, 100, 1000)
 	if err != nil {
 		t.Fatalf("AddPort failed. Error: %s", err)
 	}
