@@ -2,8 +2,13 @@ package drivers
 
 import (
 	"crypto/rand"
+	"encoding/hex"
+	"fmt"
+	"io"
 	"net"
+	"strings"
 
+	"github.com/Sirupsen/logrus"
 	netlink "github.com/vishvananda/netlink"
 )
 
@@ -37,6 +42,36 @@ func GenerateMACFromIP(ip net.IP) net.HardwareAddr {
 	return genMAC(ip)
 }
 
+// GenerateRandomName returns a new name joined with a prefix.  This size
+// specified is used to truncate the randomly generated value
+func GenerateRandomName(prefix string, size int) (string, error) {
+	id := make([]byte, 32)
+	if _, err := io.ReadFull(rand.Reader, id); err != nil {
+		return "", err
+	}
+	return prefix + hex.EncodeToString(id)[:size], nil
+}
+
+// GenerateIfaceName returns an interface name using the passed in
+// prefix and the length of random bytes. The api ensures that the
+// there are is no interface which exists with that name.
+func GenerateIfaceName(prefix string, len int) (string, error) {
+	for i := 0; i < 3; i++ {
+		name, err := GenerateRandomName(prefix, len)
+		if err != nil {
+			continue
+		}
+		_, err = netlink.LinkByName(name)
+		if err != nil {
+			if strings.Contains(err.Error(), "not found") {
+				return name, nil
+			}
+			return "", err
+		}
+	}
+	return "", fmt.Errorf("could not generate interface name")
+}
+
 // SetInterfaceIP  Set IP address of an interface
 func SetInterfaceIP(name string, ipstr string) error {
 	iface, err := netlink.LinkByName(name)
@@ -62,4 +97,56 @@ func SetInterfaceMac(name string, macaddr string) error {
 		return err
 	}
 	return netlink.LinkSetHardwareAddr(iface, hwaddr)
+}
+
+// CreateVethPair creates veth interface pairs with specified name
+func CreateVethPair(name1, name2 string) error {
+	logrus.Infof("Creating Veth pairs with name: %s, %s", name1, name2)
+
+	// Veth pair params
+	veth := &netlink.Veth{
+		LinkAttrs: netlink.LinkAttrs{
+			Name:   name1,
+			TxQLen: 0,
+		},
+		PeerName: name2,
+	}
+
+	// Create the veth pair
+	if err := netlink.LinkAdd(veth); err != nil {
+		logrus.Errorf("error creating veth pair: %v", err)
+		return err
+	}
+
+	return nil
+}
+
+// DeleteVethPair deletes veth interface pairs
+func DeleteVethPair(name1, name2 string) error {
+	logrus.Infof("Deleting Veth pairs with name: %s, %s", name1, name2)
+
+	// Veth pair params
+	veth := &netlink.Veth{
+		LinkAttrs: netlink.LinkAttrs{
+			Name:   name1,
+			TxQLen: 0,
+		},
+		PeerName: name2,
+	}
+
+	// Create the veth pair
+	if err := netlink.LinkDel(veth); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// SetLinkUp sets the link up
+func SetLinkUp(name string) error {
+	iface, err := netlink.LinkByName(name)
+	if err != nil {
+		return err
+	}
+	return netlink.LinkSetUp(iface)
 }

@@ -3,7 +3,9 @@ package main
 import (
 	"os"
 
+	"github.com/Sirupsen/logrus"
 	"github.com/XiaoweiQian/ovs-driver/drivers"
+	"github.com/codegangsta/cli"
 	pluginNet "github.com/docker/go-plugins-helpers/network"
 )
 
@@ -31,7 +33,7 @@ func main() {
 // Run initializes the driver
 func Run(ctx *cli.Context) {
 	if ctx.Bool("debug") {
-		log.SetLevel(log.DebugLevel)
+		logrus.SetLevel(logrus.DebugLevel)
 	}
 
 	d, err := drivers.NewDriver()

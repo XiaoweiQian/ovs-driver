@@ -3,6 +3,7 @@ package drivers
 import (
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -11,11 +12,18 @@ import (
 )
 
 const (
+	ovsBridgeName    = "ovs-br0"
 	mtuOption        = "mtu"
 	vlanOption       = "vlan"
 	bandwidthOption  = "bandwidth"
 	brustOption      = "brust"
+	genericOption    = "com.docker.network.generic"
+	intfLen          = 7
+	intfPrefix       = "port"
 	containerEthName = "eth"
+	useVeth          = true
+	internalPort     = "internal"
+	vethPort         = ""
 )
 
 type networkTable map[string]*network
@@ -38,10 +46,9 @@ type network struct {
 	id        string
 	vlan      int
 	gateway   string
-	bandwidth int64
-	brust     int64
-	driver    *driver
-	sbox      osl.Sandbox
+	bandwidth int
+	brust     int
+	driver    *Driver
 	endpoints endpointTable
 	subnets   []*subnet
 	sync.Mutex
@@ -58,7 +65,7 @@ type endpoint struct {
 // NewDriver ...
 func NewDriver() (*Driver, error) {
 	// initiate the OvsdbDriver
-	ovsdb, err := NewOvsdbDriver("ovsbr")
+	ovsdb, err := NewOvsdbDriver(ovsBridgeName)
 	if err != nil {
 		return nil, fmt.Errorf("ovsdb driver init failed. Error: %s", err)
 	}
@@ -83,37 +90,39 @@ func (d *Driver) GetCapabilities() (*pluginNet.CapabilitiesResponse, error) {
 
 // CreateNetwork ...
 func (d *Driver) CreateNetwork(r *pluginNet.CreateNetworkRequest) error {
-	logrus.Debugf("CreateNetwork ovs")
 	id := r.NetworkID
+	opts := r.Options
 	ipV4Data := r.IPv4Data
+	logrus.Debugf("CreateNetwork ovs with networkID=%s,opts=%s", id, opts)
 	if id == "" {
 		return fmt.Errorf("invalid network id")
 	}
-	if len(ipV4Data) == 0 || ipV4Data[0].Pool.String() == "0.0.0.0/0" {
+	if len(ipV4Data) == 0 {
 		return fmt.Errorf("ipv4 pool is empty")
 	}
-	gateway, mask, err := getGatewayIP(r)
+	gateway, _, err := getGatewayIP(ipV4Data)
 	if err != nil {
 		return err
 	}
-
 	n := &network{
 		id:        id,
 		driver:    d,
 		endpoints: endpointTable{},
 		subnets:   []*subnet{},
 		gateway:   gateway,
-		vlan:      getVlan(r),
-		brust:     getBrust(r),
-		bandwidth: getBandwith(r),
+		vlan:      getVlan(opts),
+		brust:     getBrust(opts),
+		bandwidth: getBandwidth(opts),
 	}
 
-	for i, ipd := range ipV4Data {
+	var pool, gw *net.IPNet
+	for _, ipd := range ipV4Data {
+		_, pool, _ = net.ParseCIDR(ipd.Pool)
+		_, gw, _ = net.ParseCIDR(ipd.Gateway)
 		s := &subnet{
-			subnetIP: ipd.Pool,
-			gwIP:     ipd.Gateway,
+			subnetIP: pool,
+			gwIP:     gw,
 		}
-
 		n.subnets = append(n.subnets, s)
 	}
 
@@ -138,12 +147,20 @@ func (d *Driver) DeleteNetwork(r *pluginNet.DeleteNetworkRequest) error {
 	if !ok {
 		return fmt.Errorf("could not find network with id %s", nid)
 	}
-
+	var ovsPortName string
 	for _, ep := range n.endpoints {
 		if ep.intfName != "" {
-			if err := d.ovsdb.DelPort(intfName); err != nil {
-				return fmt.Errorf("ovs could not delete port with name %s", intfName)
+			if useVeth {
+				// Get OVS port name
+				ovsPortName = getOvsPortName(ep.intfName)
+				if err := DeleteVethPair(ep.intfName, ovsPortName); err != nil {
+					return fmt.Errorf("delete veth pair failed with InterfaceName=%s,peer=%s,err=%s", ep.intfName, ovsPortName, err)
+				}
 			}
+			if err := d.ovsdb.DelPort(ovsPortName); err != nil {
+				return fmt.Errorf("ovs could not delete port with name %s", ovsPortName)
+			}
+
 		}
 
 	}
@@ -156,8 +173,9 @@ func (d *Driver) DeleteNetwork(r *pluginNet.DeleteNetworkRequest) error {
 
 // AllocateNetwork ...
 func (d *Driver) AllocateNetwork(r *pluginNet.AllocateNetworkRequest) (*pluginNet.AllocateNetworkResponse, error) {
-	logrus.Debugf("AllocateNetwork ovs")
 	id := r.NetworkID
+	opts := r.Options
+	logrus.Debugf("AllocateNetwork ovs with networkID=%s,opts=%s", id, opts)
 	ipV4Data := r.IPv4Data
 	if id == "" {
 		return nil, fmt.Errorf("invalid network id for ovs network")
@@ -166,34 +184,28 @@ func (d *Driver) AllocateNetwork(r *pluginNet.AllocateNetworkRequest) (*pluginNe
 	if ipV4Data == nil {
 		return nil, fmt.Errorf("empty ipv4 data passed during ovs network creation")
 	}
-	gateway, mask, err := getGatewayIP(r)
-	if err != nil {
-		return err
-	}
-
-	opts := r.Options
 
 	n := &network{
-		id:        id,
-		driver:    d,
-		gateway:   gateway,
-		subnets:   []*subnet{},
-		vlan:      getVlan(r),
-		brust:     getBrust(r),
-		bandwidth: getBandwith(r),
+		id:      id,
+		driver:  d,
+		subnets: []*subnet{},
 	}
-	for i, ipd := range ipV4Data {
+	var pool, gw *net.IPNet
+	for _, ipd := range ipV4Data {
+		_, pool, _ = net.ParseCIDR(ipd.Pool)
+		_, gw, _ = net.ParseCIDR(ipd.Gateway)
 		s := &subnet{
-			subnetIP: ipd.Pool,
-			gwIP:     ipd.Gateway,
+			subnetIP: pool,
+			gwIP:     gw,
 		}
 		n.subnets = append(n.subnets, s)
 	}
 	d.Lock()
 	d.networks[id] = n
 	d.Unlock()
+	res := &pluginNet.AllocateNetworkResponse{Options: opts}
 
-	return opts, nil
+	return res, nil
 
 }
 
@@ -206,11 +218,12 @@ func (d *Driver) FreeNetwork(r *pluginNet.FreeNetworkRequest) error {
 	}
 
 	d.Lock()
-	n, ok := d.networks[id]
+	_, ok := d.networks[id]
 	d.Unlock()
 
 	if !ok {
-		return fmt.Errorf("ovs network with id %s not found", id)
+		logrus.Debugf("ovs network with id %s not found", id)
+		return nil
 	}
 
 	d.Lock()
@@ -225,47 +238,69 @@ func (d *Driver) CreateEndpoint(r *pluginNet.CreateEndpointRequest) (*pluginNet.
 	logrus.Debugf("CreateEndpoint ovs")
 	networkID := r.NetworkID
 	if networkID == "" {
-		return fmt.Errorf("invalid network id passed while create ovs endpoint")
+		return nil, fmt.Errorf("invalid network id passed while create ovs endpoint")
 	}
 	endpointID := r.EndpointID
 	if endpointID == "" {
-		return fmt.Errorf("invalid endpoint id passed while create ovs endpoint")
+		return nil, fmt.Errorf("invalid endpoint id passed while create ovs endpoint")
 	}
 	intf := r.Interface
 	if intf == nil {
-		return fmt.Errorf("invalid interface passed while create ovs endpoint")
+		return nil, fmt.Errorf("invalid interface passed while create ovs endpoint")
 	}
 	n, ok := d.networks[networkID]
 	if !ok {
-		return fmt.Errorf("ovs network with id %s not found", networkID)
+		return nil, fmt.Errorf("ovs network with id %s not found", networkID)
+	}
+	_, addr, _ := net.ParseCIDR(intf.Address)
+	mac, _ := net.ParseMAC(intf.MacAddress)
+	intfName, err := GenerateIfaceName(intfPrefix, intfLen)
+	if err != nil {
+		return nil, fmt.Errorf("ovs generate interface name err=%s", err)
 	}
 	ep := &endpoint{
-		id:   endpointID,
-		nid:  networkID,
-		addr: intf.Address,
-		mac:  intf.MacAddress,
+		id:       endpointID,
+		nid:      networkID,
+		intfName: intfName,
+		addr:     addr,
+		mac:      mac,
 	}
 	if ep.addr == nil {
-		return fmt.Errorf("create endpoint was not passed interface IP address")
+		return nil, fmt.Errorf("create endpoint was not passed interface IP address")
 	}
 
 	if s := n.getSubnetforIP(ep.addr); s == nil {
-		return fmt.Errorf("no matching subnet for IP %q in network %q", ep.addr, ep.nid)
+		return nil, fmt.Errorf("no matching subnet for IP %q in network %q", ep.addr, ep.nid)
 	}
 
 	if ep.mac == nil {
-		ep.mac = GenerateMACFromIP(ep.addr.IP)
-		intf.MacAddress = ep.mac
+		ep.mac = GenerateRandomMAC()
+		intf.MacAddress = ep.mac.String()
 	}
 
-	err := d.ovsdb.AddPort(addr, mac, intfName, n.vlan, n.brust, n.bandwidth)
+	portType := internalPort
+	ovsPortName := intfName
+	if useVeth {
+		portType = vethPort
+		// Get OVS port name
+		ovsPortName = getOvsPortName(intfName)
+		// Create a Veth pair
+		err = CreateVethPair(intfName, ovsPortName)
+		if err != nil {
+			logrus.Errorf("Error creating veth pairs. Err: %v", err)
+			return nil, err
+		}
+	}
+
+	logrus.Debugf("ovs create endpoint with addr=%s,mac=%s,intfName=%s,vlan=%d,brust=%d,bandwidth=%d,err=%s", ep.addr.String(), ep.mac.String(), ovsPortName, n.vlan, n.brust, n.bandwidth, err)
+	err = d.ovsdb.AddPort(ovsPortName, portType, n.vlan, n.brust, n.bandwidth)
 	if err != nil {
-		return fmt.Errorf("ovs create endpoint error with addr=%s,mac=%s,intfName=%s,vlan=%s,brust=%s,bandwidth=%s,err=%s", addr, mac, intfName, vlan, brust, bandwidth, err)
+		return nil, fmt.Errorf("ovs create endpoint error with addr=%s,mac=%s,intfName=%s,vlan=%d,brust=%d,bandwidth=%d,err=%s", ep.addr.String(), ep.mac.String(), ovsPortName, n.vlan, n.brust, n.bandwidth, err)
 	}
 	n.Lock()
 	n.endpoints[ep.id] = ep
 	n.Unlock()
-	epResponse := &pluginNet.CreateEndpointResponse{Interface: intf}
+	epResponse := &pluginNet.CreateEndpointResponse{Interface: &pluginNet.EndpointInterface{"", "", intf.MacAddress}}
 	return epResponse, nil
 }
 
@@ -292,9 +327,13 @@ func (d *Driver) DeleteEndpoint(r *pluginNet.DeleteEndpointRequest) error {
 	if intfName == "" {
 		return nil
 	}
-	err := d.ovsdb.DelPort(intfName)
-	if err != nil {
-		return fmt.Errorf("ovs delete endpoint failed with InterfaceName=%s,err=%s", intfName, err)
+	ovsPortName := intfName
+	if useVeth {
+		// Get OVS port name
+		ovsPortName = getOvsPortName(intfName)
+		if err := DeleteVethPair(intfName, ovsPortName); err != nil {
+			return fmt.Errorf("delete veth pair failed with InterfaceName=%s,peer=%s,err=%s", intfName, ovsPortName, err)
+		}
 	}
 	n.Lock()
 	delete(n.endpoints, eid)
@@ -318,26 +357,37 @@ func (d *Driver) Join(r *pluginNet.JoinRequest) (*pluginNet.JoinResponse, error)
 	nid := r.NetworkID
 	eid := r.EndpointID
 	if nid == "" {
-		return fmt.Errorf("invalid network id")
+		return nil, fmt.Errorf("invalid network id")
 	}
 	if eid == "" {
-		return fmt.Errorf("invalid endpoint id")
+		return nil, fmt.Errorf("invalid endpoint id")
 	}
 	n := d.networks[nid]
 	if n == nil {
-		return fmt.Errorf("network id %q not found", nid)
+		return nil, fmt.Errorf("network id %q not found", nid)
 	}
 	ep := n.endpoints[eid]
 	if ep == nil {
-		return fmt.Errorf("endpoint id %q not found", eid)
+		return nil, fmt.Errorf("endpoint id %q not found", eid)
 	}
 	intfName := ep.intfName
-	if intfName == nil {
-		return fmt.Errorf("intfName %q empty", intfName)
+	if intfName == "" {
+		return nil, fmt.Errorf("intfName %q empty", intfName)
 	}
 	s := n.getSubnetforIP(ep.addr)
 	if s == nil {
-		return fmt.Errorf("could not find subnet for endpoint %s", eid)
+		return nil, fmt.Errorf("could not find subnet for endpoint %s", eid)
+	}
+	ovsPortName := intfName
+	if useVeth {
+		// Get OVS port name
+		ovsPortName = getOvsPortName(intfName)
+	}
+	// Set the OVS side of the port as up
+	err := SetLinkUp(ovsPortName)
+	if err != nil {
+		logrus.Errorf("Error setting link %s up. Err: %v", ovsPortName, err)
+		return nil, err
 	}
 
 	res := &pluginNet.JoinResponse{
@@ -347,7 +397,7 @@ func (d *Driver) Join(r *pluginNet.JoinRequest) (*pluginNet.JoinResponse, error)
 		},
 		Gateway: n.gateway,
 	}
-	logrus.Debugf("Join ovs endpoint %s:%s to %s", r.NetworkID, r.EndpointID, r.SandboxKey)
+	logrus.Debugf("Join ovs with port=%s,ip=%s and mac=%s", ovsPortName, ep.addr.String(), ep.mac.String())
 	return res, nil
 
 }
@@ -372,66 +422,75 @@ func (d *Driver) Leave(r *pluginNet.LeaveRequest) error {
 		return fmt.Errorf("endpoint id %q not found", eid)
 	}
 	intfName := ep.intfName
-	if intfName == nil {
+	if intfName == "" {
 		return fmt.Errorf("intfName %q empty", intfName)
 	}
-	err := d.ovsdb.DelPort(intfName)
-	if err != nil {
-		return fmt.Errorf("ovs leave and delete endpoint failed with InterfaceName=%s,err=%s", intfName, err)
+	ovsPortName := intfName
+	if useVeth {
+		// Get OVS port name
+		ovsPortName = getOvsPortName(intfName)
 	}
-	n.Lock()
-	delete(n.endpoints, eid)
-	n.Unlock()
+	err := d.ovsdb.DelPort(ovsPortName)
+	if err != nil {
+		return fmt.Errorf("ovs delete endpoint failed with InterfaceName=%s,err=%s", intfName, err)
+	}
 
 	return nil
 }
 
 // DiscoverNew ...
 func (d *Driver) DiscoverNew(r *pluginNet.DiscoveryNotification) error {
-	panic("not implemented")
+	logrus.Debugf("DiscoverNew ovs")
+	return nil
 }
 
 // DiscoverDelete ...
 func (d *Driver) DiscoverDelete(r *pluginNet.DiscoveryNotification) error {
-	panic("not implemented")
+	logrus.Debugf("DiscoverDelete ovs")
+	return nil
 }
 
 // ProgramExternalConnectivity ...
 func (d *Driver) ProgramExternalConnectivity(r *pluginNet.ProgramExternalConnectivityRequest) error {
-	panic("not implemented")
+	logrus.Debugf("ProgramExternalConnectivity ovs")
+	return nil
 }
 
 // RevokeExternalConnectivity ...
 func (d *Driver) RevokeExternalConnectivity(r *pluginNet.RevokeExternalConnectivityRequest) error {
-	panic("not implemented")
+	logrus.Debugf("RevokeExternalConnectivity ovs")
+	return nil
 }
 
-func getVlan(r *pluginNet.CreateNetworkRequest) (int, error) {
+func getVlan(opts map[string]interface{}) int {
 	vlan := 0
-	if r.Options != nil {
-		if v, ok := r.Options[vlanOption].(int); ok {
-			vlan = v
+	if opts != nil {
+		if o, ok := opts[genericOption].(map[string]interface{}); ok {
+			v, _ := o[vlanOption].(string)
+			vlan, _ = strconv.Atoi(v)
 		}
 	}
-	return vlan, nil
+	return vlan
 }
-func getBandwith(r *pluginNet.CreateNetworkRequest) (int64, error) {
-	bandwidth := 0
-	if r.Options != nil {
-		if b, ok := r.Options[bandwidthOption].(int); ok {
-			bandwidth = b
+func getBandwidth(opts map[string]interface{}) int {
+	var bandwidth int
+	if opts != nil {
+		if o, ok := opts[genericOption].(map[string]interface{}); ok {
+			b, _ := o[bandwidthOption].(string)
+			bandwidth, _ = strconv.Atoi(b)
 		}
 	}
-	return bandwidth, nil
+	return bandwidth
 }
-func getBrust(r *pluginNet.CreateNetworkRequest) (int64, error) {
-	brust := 0
-	if r.Options != nil {
-		if b, ok := r.Options[brustOption].(int); ok {
-			brust = b
+func getBrust(opts map[string]interface{}) int {
+	var brust int
+	if opts != nil {
+		if o, ok := opts[genericOption].(map[string]interface{}); ok {
+			b, _ := o[brustOption].(string)
+			brust, _ = strconv.Atoi(b)
 		}
 	}
-	return brust, nil
+	return brust
 }
 
 // getSubnetforIP returns the subnet to which the given IP belongs
@@ -450,13 +509,13 @@ func (n *network) getSubnetforIP(ip *net.IPNet) *subnet {
 	return nil
 }
 
-func getGatewayIP(r *pluginNet.CreateNetworkRequest) (string, string, error) {
+func getGatewayIP(ipv4 []*pluginNet.IPAMData) (string, string, error) {
 	var gatewayIP string
 
-	if len(r.IPv4Data) > 0 {
-		if r.IPv4Data[0] != nil {
-			if r.IPv4Data[0].Gateway != "" {
-				gatewayIP = r.IPv4Data[0].Gateway
+	if len(ipv4) > 0 {
+		if ipv4[0] != nil {
+			if ipv4[0].Gateway != "" {
+				gatewayIP = ipv4[0].Gateway
 			}
 		}
 	}
@@ -469,4 +528,10 @@ func getGatewayIP(r *pluginNet.CreateNetworkRequest) (string, string, error) {
 		return "", "", fmt.Errorf("Cannot split gateway IP address")
 	}
 	return parts[0], parts[1], nil
+}
+
+// getOvsPortName returns OVS port name depending on if we use Veth pairs
+func getOvsPortName(intfName string) string {
+	ovsPortName := strings.Replace(intfName, "port", "vport", 1)
+	return ovsPortName
 }

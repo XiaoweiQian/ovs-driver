@@ -10,16 +10,15 @@ import (
 )
 
 const (
-	ovsDataBase  = "Open_vSwitch"
-	socketFile   = "/var/run/openvswitch/db.sock"
-	bridgeName   = "ovsbr"
-	portTable    = "Port"
-	intfTable    = "Interface"
-	bridgeTable  = "Bridge"
-	insertOp     = "insert"
-	mutateOp     = "mutate"
-	deleteOp     = "delete"
-	internalPort = "internal"
+	ovsDataBase = "Open_vSwitch"
+	socketFile  = "/var/run/openvswitch/db.sock"
+	bridgeName  = "ovsbr"
+	portTable   = "Port"
+	intfTable   = "Interface"
+	bridgeTable = "Bridge"
+	insertOp    = "insert"
+	mutateOp    = "mutate"
+	deleteOp    = "delete"
 )
 
 //OvsdbDriver ...
@@ -55,7 +54,7 @@ func NewOvsdbDriver(bridgeName string) (*OvsdbDriver, error) {
 }
 
 // AddPort create a ovs internal port
-func (d *OvsdbDriver) AddPort(addr, mac, intfName string, tag int, burst, bandwidth int64) error {
+func (d *OvsdbDriver) AddPort(intfName, intfType string, tag, burst, bandwidth int) error {
 
 	intfUUID := "intf"
 	portUUID := "port"
@@ -63,7 +62,7 @@ func (d *OvsdbDriver) AddPort(addr, mac, intfName string, tag int, burst, bandwi
 	// insert interface
 	intf := make(map[string]interface{})
 	intf["name"] = intfName
-	intf["type"] = internalPort
+	intf["type"] = intfType
 	if bandwidth != 0 {
 		intf["ingress_policing_rate"] = bandwidth
 	}
@@ -113,18 +112,7 @@ func (d *OvsdbDriver) AddPort(addr, mac, intfName string, tag int, burst, bandwi
 	if err != nil {
 		return err
 	}
-	// set ip
-	err = SetInterfaceIP(intfName, addr)
-	if err != nil {
-		return err
-	}
-	//set mac
-	err = SetInterfaceMac(intfName, mac)
-	if err != nil {
-		return err
-	}
 	return nil
-
 }
 
 // DelPort ...
@@ -170,7 +158,7 @@ func (d *OvsdbDriver) DelPort(intfName string) error {
 
 	// do transaction
 	ops := []libovsdb.Operation{intfOp, portOp, mutateOp}
-	return d.doOperations(ops), nil
+	return d.doOperations(ops)
 
 }
 
@@ -213,25 +201,26 @@ func (d *OvsdbDriver) doOperations(ops []libovsdb.Operation) error {
 
 //Update ...
 func (d *OvsdbDriver) Update(context interface{}, tableUpdates libovsdb.TableUpdates) {
-	panic("not implemented")
+	logrus.Debugf("update ovs")
+	d.populateCache(tableUpdates)
 }
 
 //Locked ...
 func (d *OvsdbDriver) Locked([]interface{}) {
-	panic("not implemented")
+	logrus.Debugf("Locked ovs")
 }
 
 //Stolen ...
 func (d *OvsdbDriver) Stolen([]interface{}) {
-	panic("not implemented")
+	logrus.Debugf("Stolen ovs")
 }
 
 //Echo ...
 func (d *OvsdbDriver) Echo([]interface{}) {
-	panic("not implemented")
+	logrus.Debugf("Echo ovs")
 }
 
 //Disconnected ...
 func (d *OvsdbDriver) Disconnected(*libovsdb.OvsdbClient) {
-	panic("not implemented")
+	logrus.Debugf("Disconnected ovs")
 }
