@@ -6,8 +6,10 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/Sirupsen/logrus"
+	"github.com/XiaoweiQian/ovs-driver/utils/netutils"
 	pluginNet "github.com/docker/go-plugins-helpers/network"
 )
 
@@ -153,7 +155,7 @@ func (d *Driver) DeleteNetwork(r *pluginNet.DeleteNetworkRequest) error {
 			if useVeth {
 				// Get OVS port name
 				ovsPortName = getOvsPortName(ep.intfName)
-				if err := DeleteVethPair(ep.intfName, ovsPortName); err != nil {
+				if err := netutils.DeleteVethPair(ep.intfName, ovsPortName); err != nil {
 					return fmt.Errorf("delete veth pair failed with InterfaceName=%s,peer=%s,err=%s", ep.intfName, ovsPortName, err)
 				}
 			}
@@ -254,7 +256,7 @@ func (d *Driver) CreateEndpoint(r *pluginNet.CreateEndpointRequest) (*pluginNet.
 	}
 	_, addr, _ := net.ParseCIDR(intf.Address)
 	mac, _ := net.ParseMAC(intf.MacAddress)
-	intfName, err := GenerateIfaceName(intfPrefix, intfLen)
+	intfName, err := netutils.GenerateIfaceName(intfPrefix, intfLen)
 	if err != nil {
 		return nil, fmt.Errorf("ovs generate interface name err=%s", err)
 	}
@@ -274,7 +276,7 @@ func (d *Driver) CreateEndpoint(r *pluginNet.CreateEndpointRequest) (*pluginNet.
 	}
 
 	if ep.mac == nil {
-		ep.mac = GenerateRandomMAC()
+		ep.mac = netutils.GenerateRandomMAC()
 		intf.MacAddress = ep.mac.String()
 	}
 
@@ -285,7 +287,7 @@ func (d *Driver) CreateEndpoint(r *pluginNet.CreateEndpointRequest) (*pluginNet.
 		// Get OVS port name
 		ovsPortName = getOvsPortName(intfName)
 		// Create a Veth pair
-		err = CreateVethPair(intfName, ovsPortName)
+		err = netutils.CreateVethPair(intfName, ovsPortName)
 		if err != nil {
 			logrus.Errorf("Error creating veth pairs. Err: %v", err)
 			return nil, err
@@ -331,7 +333,7 @@ func (d *Driver) DeleteEndpoint(r *pluginNet.DeleteEndpointRequest) error {
 	if useVeth {
 		// Get OVS port name
 		ovsPortName = getOvsPortName(intfName)
-		if err := DeleteVethPair(intfName, ovsPortName); err != nil {
+		if err := netutils.DeleteVethPair(intfName, ovsPortName); err != nil {
 			return fmt.Errorf("delete veth pair failed with InterfaceName=%s,peer=%s,err=%s", intfName, ovsPortName, err)
 		}
 	}
@@ -383,8 +385,10 @@ func (d *Driver) Join(r *pluginNet.JoinRequest) (*pluginNet.JoinResponse, error)
 		// Get OVS port name
 		ovsPortName = getOvsPortName(intfName)
 	}
+	// Wait a little for OVS to create the interface
+	time.Sleep(300 * time.Millisecond)
 	// Set the OVS side of the port as up
-	err := SetLinkUp(ovsPortName)
+	err := netutils.SetLinkUp(ovsPortName)
 	if err != nil {
 		logrus.Errorf("Error setting link %s up. Err: %v", ovsPortName, err)
 		return nil, err

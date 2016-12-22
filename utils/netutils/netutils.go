@@ -1,4 +1,4 @@
-package drivers
+package netutils
 
 import (
 	"crypto/rand"

@@ -1,14 +1,16 @@
 package drivers
 
-import "testing"
-import netlink "github.com/vishvananda/netlink"
+import (
+	"testing"
+	"time"
+
+	"github.com/docker/docker/pkg/testutil/assert"
+	netlink "github.com/vishvananda/netlink"
+)
 
 func initOvsdbDriver(t *testing.T) *OvsdbDriver {
 	d, err := NewOvsdbDriver("ovs-br0")
-	if err != nil {
-		t.Fatalf("driver init failed. Error: %s", err)
-	}
-
+	assert.NilError(t, err)
 	return d
 }
 
@@ -20,24 +22,21 @@ func TestNewOvsdbDriver(t *testing.T) {
 func TestAddlPort(t *testing.T) {
 	d := initOvsdbDriver(t)
 	ovsPortName := "port1"
-	ovsPortType := ""
+	ovsPortType := "internal"
 	err := d.AddPort(ovsPortName, ovsPortType, 10, 100, 1000)
-	if err != nil {
-		t.Fatalf("AddPort failed. Error: %s", err)
-	}
+	assert.NilError(t, err)
+
+	// Wait a little for OVS to create the interface
+	time.Sleep(300 * time.Millisecond)
 	_, err = netlink.LinkByName(ovsPortName)
-	if err != nil {
-		t.Fatalf("AddPort failed. Error: %s", err)
-	}
+	assert.NilError(t, err)
 
 	err = d.DelPort(ovsPortName)
-	if err != nil {
-		t.Fatalf("DelPort failed. Error: %s", err)
-	}
+	assert.NilError(t, err)
 
+	// Wait a little for OVS to create the interface
+	time.Sleep(300 * time.Millisecond)
 	_, err = netlink.LinkByName(ovsPortName)
-	if err == nil {
-		t.Fatalf("DelPort failed. Error: %s", err)
-	}
+	assert.NotNil(t, err)
 	//defer func() { d.ovsClient.Disconnect }()
 }
