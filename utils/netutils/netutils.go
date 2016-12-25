@@ -9,7 +9,7 @@ import (
 	"strings"
 
 	"github.com/Sirupsen/logrus"
-	netlink "github.com/vishvananda/netlink"
+	"github.com/vishvananda/netlink"
 )
 
 func genMAC(ip net.IP) net.HardwareAddr {

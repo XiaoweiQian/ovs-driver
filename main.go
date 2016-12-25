@@ -10,7 +10,8 @@ import (
 )
 
 const (
-	version = "0.1"
+	version     = "0.1"
+	networkType = "ovs"
 )
 
 func main() {
@@ -36,10 +37,10 @@ func Run(ctx *cli.Context) {
 		logrus.SetLevel(logrus.DebugLevel)
 	}
 
-	d, err := drivers.NewDriver()
+	d, err := drivers.Init()
 	if err != nil {
 		panic(err)
 	}
 	h := pluginNet.NewHandler(d)
-	h.ServeUnix("root", "ovs")
+	h.ServeUnix("root", networkType)
 }

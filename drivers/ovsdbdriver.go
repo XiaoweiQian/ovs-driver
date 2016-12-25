@@ -117,6 +117,7 @@ func (d *OvsdbDriver) AddPort(intfName, intfType string, tag, burst, bandwidth i
 
 // DelPort ...
 func (d *OvsdbDriver) DelPort(intfName string) error {
+	logrus.Debugf("delete ovs port name =%s", intfName)
 	portUUID := []libovsdb.UUID{{GoUUID: intfName}}
 	condition := libovsdb.NewCondition("name", "==", intfName)
 

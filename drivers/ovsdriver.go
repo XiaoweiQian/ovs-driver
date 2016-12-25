@@ -11,9 +11,13 @@ import (
 	"github.com/Sirupsen/logrus"
 	"github.com/XiaoweiQian/ovs-driver/utils/netutils"
 	pluginNet "github.com/docker/go-plugins-helpers/network"
+	"github.com/docker/libkv/store/boltdb"
+	"github.com/docker/libnetwork/datastore"
+	docker "github.com/fsouza/go-dockerclient"
 )
 
 const (
+	swarmEndpoint    = "http://localhost:6732"
 	ovsBridgeName    = "ovs-br0"
 	mtuOption        = "mtu"
 	vlanOption       = "vlan"
@@ -29,13 +33,14 @@ const (
 )
 
 type networkTable map[string]*network
-type endpointTable map[string]*endpoint
 
 //Driver aa
 type Driver struct {
-	id       string
-	ovsdb    *OvsdbDriver
-	networks networkTable
+	id         string
+	ovsdb      *OvsdbDriver
+	networks   networkTable
+	localStore datastore.DataStore
+	client     *docker.Client
 	sync.Mutex
 }
 
@@ -47,7 +52,6 @@ type subnet struct {
 type network struct {
 	id        string
 	vlan      int
-	gateway   string
 	bandwidth int
 	brust     int
 	driver    *Driver
@@ -56,18 +60,12 @@ type network struct {
 	sync.Mutex
 }
 
-type endpoint struct {
-	id       string
-	nid      string
-	intfName string
-	mac      net.HardwareAddr
-	addr     *net.IPNet
-}
-
-// NewDriver ...
-func NewDriver() (*Driver, error) {
+// Init ...
+func Init() (*Driver, error) {
 	// initiate the OvsdbDriver
 	ovsdb, err := NewOvsdbDriver(ovsBridgeName)
+	// initiate the boltdb
+	boltdb.Register()
 	if err != nil {
 		return nil, fmt.Errorf("ovsdb driver init failed. Error: %s", err)
 	}
@@ -76,10 +74,26 @@ func NewDriver() (*Driver, error) {
 		return nil, fmt.Errorf("could not connect to open vswitch")
 	}
 
-	d := &Driver{
-		ovsdb:    ovsdb,
-		networks: networkTable{},
+	client, err := docker.NewClient(swarmEndpoint)
+	if err != nil {
+		return nil, fmt.Errorf("could not connect to swarm. Error: %s", err)
 	}
+
+	store, err := datastore.NewDataStore(datastore.LocalScope, nil)
+	if err != nil {
+		return nil, fmt.Errorf("could not init ovs local store. Error: %s", err)
+	}
+
+	d := &Driver{
+		ovsdb:      ovsdb,
+		networks:   networkTable{},
+		localStore: store,
+		client:     client,
+	}
+	if err := d.restoreEndpoints(); err != nil {
+		logrus.Debugf("Failure during ovs endpoints restore: %v", err)
+	}
+
 	return d, nil
 }
 
@@ -102,16 +116,11 @@ func (d *Driver) CreateNetwork(r *pluginNet.CreateNetworkRequest) error {
 	if len(ipV4Data) == 0 {
 		return fmt.Errorf("ipv4 pool is empty")
 	}
-	gateway, _, err := getGatewayIP(ipV4Data)
-	if err != nil {
-		return err
-	}
 	n := &network{
 		id:        id,
 		driver:    d,
 		endpoints: endpointTable{},
 		subnets:   []*subnet{},
-		gateway:   gateway,
 		vlan:      getVlan(opts),
 		brust:     getBrust(opts),
 		bandwidth: getBandwidth(opts),
@@ -149,22 +158,10 @@ func (d *Driver) DeleteNetwork(r *pluginNet.DeleteNetworkRequest) error {
 	if !ok {
 		return fmt.Errorf("could not find network with id %s", nid)
 	}
-	var ovsPortName string
 	for _, ep := range n.endpoints {
-		if ep.intfName != "" {
-			if useVeth {
-				// Get OVS port name
-				ovsPortName = getOvsPortName(ep.intfName)
-				if err := netutils.DeleteVethPair(ep.intfName, ovsPortName); err != nil {
-					return fmt.Errorf("delete veth pair failed with InterfaceName=%s,peer=%s,err=%s", ep.intfName, ovsPortName, err)
-				}
-			}
-			if err := d.ovsdb.DelPort(ovsPortName); err != nil {
-				return fmt.Errorf("ovs could not delete port with name %s", ovsPortName)
-			}
-
+		if err := d.deleteEndpoint(n, ep); err != nil {
+			return err
 		}
-
 	}
 	d.Lock()
 	delete(d.networks, nid)
@@ -235,124 +232,6 @@ func (d *Driver) FreeNetwork(r *pluginNet.FreeNetworkRequest) error {
 	return nil
 }
 
-// CreateEndpoint ...
-func (d *Driver) CreateEndpoint(r *pluginNet.CreateEndpointRequest) (*pluginNet.CreateEndpointResponse, error) {
-	logrus.Debugf("CreateEndpoint ovs")
-	networkID := r.NetworkID
-	if networkID == "" {
-		return nil, fmt.Errorf("invalid network id passed while create ovs endpoint")
-	}
-	endpointID := r.EndpointID
-	if endpointID == "" {
-		return nil, fmt.Errorf("invalid endpoint id passed while create ovs endpoint")
-	}
-	intf := r.Interface
-	if intf == nil {
-		return nil, fmt.Errorf("invalid interface passed while create ovs endpoint")
-	}
-	n, ok := d.networks[networkID]
-	if !ok {
-		return nil, fmt.Errorf("ovs network with id %s not found", networkID)
-	}
-	_, addr, _ := net.ParseCIDR(intf.Address)
-	mac, _ := net.ParseMAC(intf.MacAddress)
-	intfName, err := netutils.GenerateIfaceName(intfPrefix, intfLen)
-	if err != nil {
-		return nil, fmt.Errorf("ovs generate interface name err=%s", err)
-	}
-	ep := &endpoint{
-		id:       endpointID,
-		nid:      networkID,
-		intfName: intfName,
-		addr:     addr,
-		mac:      mac,
-	}
-	if ep.addr == nil {
-		return nil, fmt.Errorf("create endpoint was not passed interface IP address")
-	}
-
-	if s := n.getSubnetforIP(ep.addr); s == nil {
-		return nil, fmt.Errorf("no matching subnet for IP %q in network %q", ep.addr, ep.nid)
-	}
-
-	if ep.mac == nil {
-		ep.mac = netutils.GenerateRandomMAC()
-		intf.MacAddress = ep.mac.String()
-	}
-
-	portType := internalPort
-	ovsPortName := intfName
-	if useVeth {
-		portType = vethPort
-		// Get OVS port name
-		ovsPortName = getOvsPortName(intfName)
-		// Create a Veth pair
-		err = netutils.CreateVethPair(intfName, ovsPortName)
-		if err != nil {
-			logrus.Errorf("Error creating veth pairs. Err: %v", err)
-			return nil, err
-		}
-	}
-
-	logrus.Debugf("ovs create endpoint with addr=%s,mac=%s,intfName=%s,vlan=%d,brust=%d,bandwidth=%d,err=%s", ep.addr.String(), ep.mac.String(), ovsPortName, n.vlan, n.brust, n.bandwidth, err)
-	err = d.ovsdb.AddPort(ovsPortName, portType, n.vlan, n.brust, n.bandwidth)
-	if err != nil {
-		return nil, fmt.Errorf("ovs create endpoint error with addr=%s,mac=%s,intfName=%s,vlan=%d,brust=%d,bandwidth=%d,err=%s", ep.addr.String(), ep.mac.String(), ovsPortName, n.vlan, n.brust, n.bandwidth, err)
-	}
-	n.Lock()
-	n.endpoints[ep.id] = ep
-	n.Unlock()
-	epResponse := &pluginNet.CreateEndpointResponse{Interface: &pluginNet.EndpointInterface{"", "", intf.MacAddress}}
-	return epResponse, nil
-}
-
-// DeleteEndpoint ...
-func (d *Driver) DeleteEndpoint(r *pluginNet.DeleteEndpointRequest) error {
-	logrus.Debugf("DeleteEndpoint ovs")
-	nid := r.NetworkID
-	eid := r.EndpointID
-	if nid == "" {
-		return fmt.Errorf("invalid network id")
-	}
-	if eid == "" {
-		return fmt.Errorf("invalid endpoint id")
-	}
-	n := d.networks[nid]
-	if n == nil {
-		return fmt.Errorf("network id %q not found", nid)
-	}
-	ep := n.endpoints[eid]
-	if ep == nil {
-		return fmt.Errorf("endpoint id %q not found", eid)
-	}
-	intfName := ep.intfName
-	if intfName == "" {
-		return nil
-	}
-	ovsPortName := intfName
-	if useVeth {
-		// Get OVS port name
-		ovsPortName = getOvsPortName(intfName)
-		if err := netutils.DeleteVethPair(intfName, ovsPortName); err != nil {
-			return fmt.Errorf("delete veth pair failed with InterfaceName=%s,peer=%s,err=%s", intfName, ovsPortName, err)
-		}
-	}
-	n.Lock()
-	delete(n.endpoints, eid)
-	n.Unlock()
-
-	return nil
-}
-
-// EndpointInfo ...
-func (d *Driver) EndpointInfo(r *pluginNet.InfoRequest) (*pluginNet.InfoResponse, error) {
-	logrus.Debugf("EndpointInfo ovs")
-	res := &pluginNet.InfoResponse{
-		Value: make(map[string]string),
-	}
-	return res, nil
-}
-
 // Join ...
 func (d *Driver) Join(r *pluginNet.JoinRequest) (*pluginNet.JoinResponse, error) {
 	logrus.Debugf("Join ovs")
@@ -399,7 +278,6 @@ func (d *Driver) Join(r *pluginNet.JoinRequest) (*pluginNet.JoinResponse, error)
 			SrcName:   intfName,
 			DstPrefix: containerEthName,
 		},
-		Gateway: n.gateway,
 	}
 	logrus.Debugf("Join ovs with port=%s,ip=%s and mac=%s", ovsPortName, ep.addr.String(), ep.mac.String())
 	return res, nil
@@ -538,4 +416,108 @@ func getGatewayIP(ipv4 []*pluginNet.IPAMData) (string, string, error) {
 func getOvsPortName(intfName string) string {
 	ovsPortName := strings.Replace(intfName, "port", "vport", 1)
 	return ovsPortName
+}
+
+// Endpoints are stored in the local store. Restore them and reconstruct
+func (d *Driver) restoreEndpoints() error {
+	if d.localStore == nil {
+		logrus.Debugf("Cannot restore ovs endpoints because local datastore is missing.")
+		return nil
+	}
+	logrus.Debugf("Restore ovs endpoints from local datastore.")
+
+	kvol, err := d.localStore.List(datastore.Key(ovsEndpointPrefix), &endpoint{})
+	if err != nil && err != datastore.ErrKeyNotFound {
+		return fmt.Errorf("failed to read ovs endpoint from store: %v", err)
+	}
+
+	if err == datastore.ErrKeyNotFound {
+		logrus.Debugf("Restore endpoint,But key not found.key=%s ", ovsEndpointPrefix)
+		return nil
+	}
+	var ovsPortName string
+	for _, kvo := range kvol {
+		ep := kvo.(*endpoint)
+		n := d.network(ep.nid)
+		if n == nil {
+			logrus.Debugf("Network (%s) not found for restored endpoint (%s)", ep.nid[0:7], ep.id[0:7])
+			logrus.Debugf("Deleting stale ovs endpoint (%s) from store", ep.id[0:7])
+			if err := d.deleteEndpointFromStore(ep); err != nil {
+				logrus.Debugf("Failed to delete stale ovs endpoint (%s) from store", ep.id[0:7])
+			}
+			ovsPortName = ep.intfName
+			if useVeth {
+				// Get OVS port name
+				ovsPortName = getOvsPortName(ep.intfName)
+				if err := netutils.DeleteVethPair(ep.intfName, ovsPortName); err != nil {
+					return fmt.Errorf("delete veth pair failed with InterfaceName=%s,peer=%s,err=%s", ep.intfName, ovsPortName, err)
+				}
+			}
+			if err := d.ovsdb.DelPort(ovsPortName); err != nil {
+				return fmt.Errorf("ovs could not delete port with name %s", ovsPortName)
+			}
+
+			continue
+		}
+		n.Lock()
+		epJSON, _ := ep.MarshalJSON()
+		logrus.Debugf("Success restore endpoint=%s from local store ", epJSON)
+		n.endpoints[ep.id] = ep
+		n.Unlock()
+	}
+	return nil
+}
+
+func (d *Driver) network(nid string) *network {
+	d.Lock()
+	n, ok := d.networks[nid]
+	d.Unlock()
+	if !ok {
+		n = d.getNetworkFromSwarm(nid)
+		if n != nil {
+			d.Lock()
+			d.networks[nid] = n
+			d.Unlock()
+		}
+	}
+
+	return n
+}
+
+func (d *Driver) getNetworkFromSwarm(nid string) *network {
+	if d.client == nil {
+		return nil
+	}
+	nw, err := d.client.NetworkInfo(nid)
+	logrus.Debugf("Network (%s)  found from swarm", nw)
+	if err != nil {
+		return nil
+	}
+	opts := nw.Options
+	subnets := nw.IPAM.Config
+	vlan, _ := strconv.Atoi(opts[vlanOption])
+	brust, _ := strconv.Atoi(opts[brustOption])
+	bandwidth, _ := strconv.Atoi(opts[bandwidthOption])
+	n := &network{
+		id:        nid,
+		driver:    d,
+		endpoints: endpointTable{},
+		vlan:      vlan,
+		brust:     brust,
+		bandwidth: bandwidth,
+		subnets:   []*subnet{},
+	}
+	var pool, gw *net.IPNet
+	for _, ipd := range subnets {
+		_, pool, _ = net.ParseCIDR(ipd.IPRange)
+		_, gw, _ = net.ParseCIDR(ipd.Gateway)
+		s := &subnet{
+			subnetIP: pool,
+			gwIP:     gw,
+		}
+		n.subnets = append(n.subnets, s)
+	}
+
+	logrus.Debugf("restore Network (%s) from swarm", n)
+	return n
 }
